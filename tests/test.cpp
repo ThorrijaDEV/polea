@@ -79,6 +79,26 @@ bool wait_frames(Client& c, int timeout_ms, std::vector<Frame>& out) {
     return false;
 }
 
+/// Barrera determinista: tras enviar una trama, un Ping seguido de su Pong
+/// garantiza que el servidor ya la aplicó (las tramas se procesan en orden
+/// por conexión, así que el Pong llega después de todo lo anterior).
+void sync_client(Client& c) {
+    Frame ping;
+    ping.type = Type::Ping;
+    CHECK(c.send_frame(ping));
+    std::vector<Frame> out;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(3000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        int n = c.recv(150, out);
+        if (n < 0) break;
+        for (auto& f : out)
+            if (f.type == Type::Pong) { out.clear(); return; }
+        out.clear();
+    }
+    CHECK(false && "no recibió Pong");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -187,7 +207,8 @@ static void test_delivery_ordering() {
     CHECK(sub2.connect("127.0.0.1", h.port(), "oyente-2") != 0);
     CHECK(sub1.subscribe("noticias"));
     CHECK(sub2.subscribe("noticias"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sync_client(sub1);
+    sync_client(sub2);
 
     for (int i = 0; i < 5; ++i) {
         CHECK(pub.publish("noticias", "nota-" + std::to_string(i)));
@@ -225,7 +246,7 @@ static void test_non_subscriber_excluded() {
     CHECK(ina.connect("127.0.0.1", h.port(), "interes") != 0);
     CHECK(otra.connect("127.0.0.1", h.port(), "ajeno") != 0);
     CHECK(ina.subscribe("deporte"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sync_client(ina);
     CHECK(pub.publish("deporte", "gol"));
     std::vector<Frame> in_f, out_f;
     CHECK(wait_frames(ina, 1000, in_f));
@@ -244,7 +265,7 @@ static void test_self_delivery() {
     Client c;
     CHECK(c.connect("127.0.0.1", h.port(), "eco") != 0);
     CHECK(c.subscribe("mi-tema"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sync_client(c);
     CHECK(c.publish("mi-tema", "eco"));
     std::vector<Frame> out;
     CHECK(wait_frames(c, 1000, out));
@@ -262,15 +283,17 @@ static void test_unsubscribe() {
     CHECK(pub.connect("127.0.0.1", h.port(), "editor") != 0);
     CHECK(sub.connect("127.0.0.1", h.port(), "fugaz") != 0);
     CHECK(sub.subscribe("canal"));
+    sync_client(sub);
     CHECK(pub.publish("canal", "uno"));
     std::vector<Frame> out;
-    CHECK(wait_frames(sub, 1000, out));
+    CHECK(wait_frames(sub, 2000, out));
     int first = 0;
     for (auto& f : out)
         if (f.type == Type::Deliver) first++;
     CHECK(first == 1);
 
     CHECK(sub.unsubscribe("canal"));
+    sync_client(sub); // garantiza que el Unsub ya se aplicó
     CHECK(pub.publish("canal", "dos"));
     out.clear();
     int n = sub.recv(300, out);
@@ -377,7 +400,7 @@ static void test_backpressure_drops() {
     CHECK(pub.connect("127.0.0.1", h.port(), "editor") != 0);
     CHECK(sub.connect("127.0.0.1", h.port(), "lento") != 0);
     CHECK(sub.subscribe("torrente"));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sync_client(sub);
 
     // El suscriptor no lee nada: el socket se llena (SO_SNDBUF=4 KiB) y la
     // cola del servidor (cap 2) empieza a descartar lo más antiguo.
@@ -500,7 +523,7 @@ static void test_many_clients() {
         CHECK(subs[i].connect("127.0.0.1", h.port(), "oye-" + std::to_string(i)) != 0);
         CHECK(subs[i].subscribe("todos"));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    for (auto& s : subs) sync_client(s);
     for (int i = 0; i < N; ++i) {
         CHECK(pubs[i].publish("todos", "m" + std::to_string(i)));
     }
